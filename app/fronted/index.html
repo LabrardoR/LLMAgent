@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>AI助手</title>
+</head>
+
+<body>
+
+  <h2>智能助手</h2>
+
+  <input id="msg">
+  <button onclick="send()">发送</button>
+
+  <div id="chat"></div>
+
+  <script>
+
+    async function send() {
+
+      let msg = document.getElementById("msg").value
+
+      let res = await fetch("http://127.0.0.1:8000/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ message: msg })
+      })
+
+      let data = await res.json()
+
+      document.getElementById("chat").innerHTML +=
+        "<p>用户:" + msg + "</p><p>AI:" + data.answer + "</p>"
+    }
+
+  </script>
+
+</body>
+
+</html>
