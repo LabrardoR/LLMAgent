@@ -1,6 +1,6 @@
 """
 Conversation实体类
-一个对话对应一个Message
+一个对话对应多条Message
 """
 import uuid
 from tortoise import fields

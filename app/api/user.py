@@ -1,8 +1,18 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.security import OAuth2PasswordRequestForm
+import os
+import uuid
+from pathlib import Path
 from app.models.user import User
-from app.schemas.user import UserCreate, UserOut, UserUpdate
-from app.core.security import get_password_hash, verify_password, create_access_token, get_current_user
+from app.schemas.user import UserCreate, UserOut, UserUpdate, PasswordUpdate
+from app.core.security import (
+    get_password_hash,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    oauth2_scheme,
+    revoke_token,
+)
 
 router = APIRouter()
 
@@ -64,5 +74,53 @@ async def update_user_me(
         raise HTTPException(status_code=400, detail="没有提供要更新的数据")
 
     await current_user.update_from_dict(user_data)
+    await current_user.save()
+    return current_user
+
+
+@router.put("/password", summary="修改密码")
+async def update_password(
+    payload: PasswordUpdate,
+    current_user: User = Depends(get_current_user),
+):
+    if not verify_password(payload.old_password, current_user.password):
+        raise HTTPException(status_code=400, detail="旧密码不正确")
+    if payload.old_password == payload.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
+
+    current_user.password = get_password_hash(payload.new_password)
+    await current_user.save()
+    return {"message": "密码已更新"}
+
+
+@router.post("/logout", summary="用户登出")
+async def logout(token: str = Depends(oauth2_scheme)):
+    revoke_token(token)
+    return {"message": "已登出"}
+
+
+@router.post("/avatar", response_model=UserOut, summary="上传头像")
+async def upload_avatar(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    filename = file.filename or ""
+    ext = Path(filename).suffix.lower()
+    allowed = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    if ext not in allowed:
+        raise HTTPException(status_code=400, detail="不支持的文件类型")
+
+    static_root = Path("app") / "static" / "avatars"
+    os.makedirs(static_root, exist_ok=True)
+
+    avatar_name = f"{current_user.user_id}.{uuid.uuid4().hex}{ext}"
+    avatar_path = static_root / avatar_name
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="空文件")
+    avatar_path.write_bytes(content)
+
+    current_user.photo_url = f"/static/avatars/{avatar_name}"
     await current_user.save()
     return current_user

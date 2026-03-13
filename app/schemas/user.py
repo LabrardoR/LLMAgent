@@ -16,6 +16,11 @@ class UserUpdate(BaseModel):
     photo_url: Optional[str] = None
 
 
+class PasswordUpdate(BaseModel):
+    old_password: str = Field(..., description="旧密码")
+    new_password: str = Field(..., description="新密码")
+
+
 class UserOut(BaseModel):
     user_id: UUID
     account: str

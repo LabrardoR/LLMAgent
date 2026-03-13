@@ -1,5 +1,5 @@
 """
-models/KnowledgeDocument.py
+models/knowledge_document.py
 """
 
 import uuid

@@ -10,13 +10,20 @@ from app.models.user import User
 
 # 从环境变量加载配置
 SECRET_KEY = os.getenv("SECRET_KEY", "a_default_secret_key_if_not_set")
-ALGORITHM = "HS256"
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/user/login")
 
 # 使用 pbkdf2_sha256 避免 bcrypt 版本冲突
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+_revoked_tokens: set[str] = set()
+
+
+def revoke_token(token: str) -> None:
+    if token:
+        _revoked_tokens.add(token)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -47,6 +54,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if token in _revoked_tokens:
+        raise credentials_exception
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")

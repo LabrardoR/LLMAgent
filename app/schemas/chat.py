@@ -26,6 +26,19 @@ class ConversationUpdate(BaseModel):
     title: str
 
 
+class ConversationCreate(BaseModel):
+    title: str = Field("新对话", description="会话标题")
+
+
+class MessageUpdate(BaseModel):
+    content: str = Field(..., description="新的内容")
+
+
+class RegenerateRequest(BaseModel):
+    conversation_id: UUID
+    message_id: UUID
+
+
 class MessageOut(BaseModel):
     message_id: UUID
     role: str
