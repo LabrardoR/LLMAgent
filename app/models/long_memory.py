@@ -11,8 +11,12 @@ class LongMemory(Model):
 
     content = fields.TextField()
 
+    memory_type = fields.CharField(max_length=50, default="profile")
+
     source_message = fields.ForeignKeyField("models.Message", null=True, related_name="memories", description="来源消息")
 
     embedding = fields.JSONField(null=True)
+
+    hit_count = fields.IntField(default=0)
 
     created_time = fields.DatetimeField(auto_now_add=True)

@@ -13,12 +13,16 @@ class KnowledgeDocument(Model):
 
     user = fields.ForeignKeyField("models.User", related_name="documents", description="所属用户")
 
-    title = fields.CharField(max_length=255)
+    title = fields.CharField(max_length=255, description="文档标题")
 
-    content = fields.TextField()
+    file_name = fields.CharField(max_length=255, description="原始文件名")
 
-    embedding = fields.JSONField(null=True)
+    file_path = fields.CharField(max_length=500, description="服务器存储路径")
 
-    source = fields.CharField(max_length=255, null=True)
+    content = fields.TextField(description="文档全文内容")
+
+    chunk_count = fields.IntField(default=0, description="切分片段数量")
+
+    status = fields.CharField(max_length=30, default="indexed", description="索引状态")
 
     created_time = fields.DatetimeField(auto_now_add=True)

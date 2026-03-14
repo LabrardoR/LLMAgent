@@ -17,6 +17,7 @@ DB_CONFIG = {
                 "app.models.message",
                 "app.models.long_memory",
                 "app.models.knowledge_document",
+                "app.models.knowledge_chunk",
                 "aerich.models"
             ],
             "default_connection": "default",

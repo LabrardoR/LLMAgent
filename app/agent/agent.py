@@ -1,6 +1,20 @@
+"""
+Agent 组装模块。
+
+职责：
+1) 管理用户可选模型；
+2) 管理内置工具与扩展工具；
+3) 根据用户设置动态构建 LangChain Agent；
+4) 为 Agent 注入系统级决策提示词。
+"""
+
 from langchain.agents import create_agent
 from langchain_community.chat_models import ChatTongyi
-from langchain_core.tools import Tool
+from langchain_core.tools import Tool, BaseTool
+from pathlib import Path
+import importlib.util
+import os
+
 from app.tools.calculator import calculator_tool
 from app.tools.search import search_tool
 from app.tools.database import database_tool
@@ -12,21 +26,85 @@ AVAILABLE_MODELS = [
     {"model_name": "qwen-max", "provider": "dashscope"},
 ]
 
-AVAILABLE_TOOLS = [
-    {"name": "calculator", "description": "数学计算"},
-    {"name": "search", "description": "搜索引擎"},
-    {"name": "database", "description": "数据库查询"},
-]
-
 _selected_model_by_user: dict[str, str] = {}
 _enabled_tools_by_user: dict[str, dict[str, bool]] = {}
+_extension_tools: dict[str, BaseTool] = {}
+
+
+def _load_extension_tools() -> None:
+    """
+    扫描并加载扩展工具目录中的工具。
+
+    约定：
+    - 每个扩展文件位于 app/tools/extensions/*.py；
+    - 文件内提供 register_tool()，返回 BaseTool 实例；
+    - 以 "_" 开头的文件视为内部文件，不参与加载。
+    """
+    _extension_tools.clear()
+    ext_dir = Path("app/tools/extensions")
+    if not ext_dir.exists():
+        return
+    for file in ext_dir.glob("*.py"):
+        if file.name.startswith("_"):
+            continue
+        module_name = f"app.tools.extensions.{file.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, file)
+        if spec is None or spec.loader is None:
+            continue
+        try:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if hasattr(module, "register_tool"):
+                tool = module.register_tool()
+                if isinstance(tool, BaseTool):
+                    _extension_tools[tool.name] = tool
+        except Exception:
+            continue
+
+
+def reload_extension_tools() -> list[dict]:
+    """重新加载扩展工具并返回最新工具列表。"""
+    _load_extension_tools()
+    return get_available_tools()
+
+
+def _builtin_tools(user_id: str = None) -> dict[str, BaseTool]:
+    """
+    构建内置工具集合。
+
+    database 工具需要绑定 user_id，确保工具查询仅作用于当前用户数据。
+    """
+    tools: dict[str, BaseTool] = {
+        "calculator": calculator_tool,
+        "search": search_tool,
+    }
+    if user_id:
+        tools["database"] = Tool(
+            name="database",
+            func=lambda query: database_tool.func(query, user_id=user_id),
+            description=database_tool.description,
+            coroutine=lambda query: database_tool.coroutine(query, user_id=user_id),
+        )
+    return tools
+
+
+def get_available_tools() -> list[dict]:
+    """返回当前系统可用工具元信息（内置 + 扩展）。"""
+    _load_extension_tools()
+    merged = {
+        **_builtin_tools("placeholder"),
+        **_extension_tools,
+    }
+    return [{"name": t.name, "description": t.description} for t in merged.values()]
 
 
 def get_selected_model(user_id: str) -> str:
+    """获取用户当前选择模型，未设置时返回默认模型。"""
     return _selected_model_by_user.get(user_id, "qwen-turbo")
 
 
 def set_selected_model(user_id: str, model_name: str) -> None:
+    """设置用户模型，并校验模型名是否合法。"""
     allowed = {m["model_name"] for m in AVAILABLE_MODELS}
     if model_name not in allowed:
         raise ValueError("model_not_supported")
@@ -34,45 +112,52 @@ def set_selected_model(user_id: str, model_name: str) -> None:
 
 
 def get_tools_enabled(user_id: str) -> dict[str, bool]:
+    """
+    获取用户工具启用状态。
+
+    若用户首次访问，则按当前可用工具初始化为全启用。
+    新增工具时会自动补齐默认状态，避免旧用户缺失开关字段。
+    """
+    available_names = [item["name"] for item in get_available_tools()]
     enabled = _enabled_tools_by_user.get(user_id)
     if enabled is None:
-        enabled = {"calculator": True, "search": True, "database": True}
+        enabled = {name: True for name in available_names}
         _enabled_tools_by_user[user_id] = enabled
+    for name in available_names:
+        enabled.setdefault(name, True)
     return enabled
 
 
 def set_tool_enabled(user_id: str, tool_name: str, enabled: bool) -> None:
-    allowed = {t["name"] for t in AVAILABLE_TOOLS}
+    """设置指定工具开关状态。"""
+    allowed = {t["name"] for t in get_available_tools()}
     if tool_name not in allowed:
         raise ValueError("tool_not_supported")
     current = get_tools_enabled(user_id)
     current[tool_name] = bool(enabled)
 
 
-def get_agent(user_id: str = None):
-    """使用 LangChain 的 ChatTongyi 创建智能助手"""
+def get_agent(user_id: str = None, context_prompt: str = ""):
+    """
+    组装可执行的 Agent 实例。
+
+    参数：
+    - user_id: 用于读取用户模型与工具配置；
+    - context_prompt: 由上层拼装的上下文（RAG/记忆等），注入 system prompt。
+    """
     tools = []
-    enabled = {"calculator": True, "search": True, "database": True}
+    available = _builtin_tools(user_id)
+    _load_extension_tools()
+    available.update(_extension_tools)
+    enabled = {name: True for name in available.keys()}
     model_name = "qwen-turbo"
     if user_id:
         enabled = get_tools_enabled(user_id)
         model_name = get_selected_model(user_id)
+    for name, tool in available.items():
+        if enabled.get(name, True):
+            tools.append(tool)
 
-    if enabled.get("calculator", True):
-        tools.append(calculator_tool)
-    if enabled.get("search", True):
-        tools.append(search_tool)
-    if user_id and enabled.get("database", True):
-        user_specific_db_tool = Tool(
-            name="database",
-            func=lambda query: database_tool.func(query, user_id=user_id),
-            description=database_tool.description,
-            coroutine=lambda query: database_tool.coroutine(query, user_id=user_id)
-        )
-        tools.append(user_specific_db_tool)
-
-    # 2. 定义大模型
-    import os
     dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
     llm = ChatTongyi(
         model=model_name,
@@ -80,11 +165,18 @@ def get_agent(user_id: str = None):
         streaming=True,
     )
 
-    # 3. 创建 Agent
+    base_prompt = (
+        "你是一个可调用工具的智能助手。"
+        "先判断是否需要工具，优先给出准确答案。"
+        "若外部上下文与用户问题冲突，优先说明冲突并给出依据。"
+    )
+    system_prompt = f"{base_prompt}\n{context_prompt}".strip()
     agent = create_agent(
         model=llm,
         tools=tools,
-        system_prompt="你是一个全能的智能助手，可以使用计算器处理数学题、使用搜索引擎查找实时信息、使用数据库查询用户的聊天历史记录。"
+        system_prompt=system_prompt
     )
-
     return agent
+
+
+AVAILABLE_TOOLS = get_available_tools()

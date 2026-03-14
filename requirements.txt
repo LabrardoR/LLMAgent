@@ -1,8 +1,10 @@
 fastapi
 uvicorn
 python-dotenv
+python-multipart
 
 langchain
+langchain-text-splitters
 langchain-openai
 langchain-community
 
@@ -12,6 +14,7 @@ aerich
 pypika-tortoise==0.2.2
 
 chromadb
+faiss-cpu
 tiktoken
 
 passlib

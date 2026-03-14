@@ -1,3 +1,13 @@
+"""
+聊天 API。
+
+主要能力：
+1) 会话与消息管理（增删改查）；
+2) SSE 流式对话；
+3) 回答重生成；
+4) 将短期记忆、长期记忆、RAG 检索上下文统一注入 Agent 输入。
+"""
+
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 
@@ -15,6 +25,9 @@ from app.models.conversation import Conversation
 from app.models.message import Message
 from app.core.security import get_current_user
 from app.agent.agent import get_agent
+from app.memory.long_memory import remember_user_facts, search_long_memory
+from app.memory.short_memory import get_recent_messages
+from app.rag.service import build_rag_context
 
 router = APIRouter()
 
@@ -119,6 +132,13 @@ async def regenerate(
     payload: RegenerateRequest,
     current_user: User = Depends(get_current_user)
 ):
+    """
+    基于历史某条用户消息重新生成回答。
+
+    策略：
+    - 删除该消息之后的所有消息，保证上下文一致；
+    - 重新构建“记忆 + 知识库 + 历史消息”输入后调用 Agent。
+    """
     conversation = await Conversation.get_or_none(conversation_id=payload.conversation_id, user=current_user, status=1)
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -140,9 +160,10 @@ async def regenerate(
 
     await Message.filter(conversation=conversation, created_time__gt=base_message.created_time).delete()
 
-    agent = get_agent(user_id=str(current_user.user_id))
+    context_prompt, model_messages = await _build_agent_messages(current_user, conversation, base_message)
+    agent = get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
     try:
-        result = await agent.ainvoke({"messages": [{"role": "user", "content": base_message.content}]})
+        result = await agent.ainvoke({"messages": model_messages})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -170,6 +191,11 @@ from fastapi.responses import StreamingResponse
 import json
 
 def _extract_text_from_agent_result(result) -> str:
+    """
+    兼容不同 LangChain 返回结构，尽量提取纯文本内容。
+
+    该函数用于同步返回与流式失败回退路径，避免因返回格式变化导致解析失败。
+    """
     if isinstance(result, str):
         return result
     if isinstance(result, dict):
@@ -201,7 +227,52 @@ def _extract_text_from_agent_result(result) -> str:
             return getattr(last, "content", "") or ""
     return str(result) if result is not None else ""
 
+
+async def _build_agent_messages(
+    current_user: User,
+    conversation: Conversation,
+    user_message: Message,
+):
+    """
+    组装模型输入消息列表。
+
+    输入由三部分组成：
+    1) 知识库检索上下文（RAG）；
+    2) 长期记忆召回内容；
+    3) 会话短期历史 + 当前用户输入。
+    """
+    user_id = str(current_user.user_id)
+    history = await get_recent_messages(
+        conversation_id=str(conversation.conversation_id),
+        limit=10,
+        before_time=user_message.created_time
+    )
+    rag_context = await build_rag_context(user_id=user_id, query=user_message.content, top_k=4)
+    long_memories = await search_long_memory(user_id=user_id, query=user_message.content, top_k=3)
+    context_blocks = []
+    if rag_context:
+        context_blocks.append(f"知识库检索结果:\n{rag_context}")
+    if long_memories:
+        context_blocks.append("长期记忆:\n" + "\n".join(long_memories))
+    context_prompt = "\n\n".join(context_blocks)
+    messages = []
+    if context_prompt:
+        messages.append({"role": "system", "content": context_prompt})
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message.content})
+    return context_prompt, messages
+
 async def stream_generator(chat_request: ChatRequest, current_user: User, conversation: Conversation, created_new: bool):
+    """
+    SSE 事件生成器。
+
+    流程：
+    - 写入用户消息并尝试抽取长期记忆；
+    - 组装上下文并流式调用 Agent；
+    - 按 token 推送到前端；
+    - 对流式空输出场景进行同步回退；
+    - 最终持久化 assistant 消息。
+    """
     def _extract_text_from_chunk(chunk) -> str:
         try:
             content = getattr(chunk, "content", None)
@@ -229,21 +300,26 @@ async def stream_generator(chat_request: ChatRequest, current_user: User, conver
 
     user_input = chat_request.messages[-1].content
 
-    await Message.create(
+    user_message = await Message.create(
         conversation=conversation,
         user=current_user,
         role="user",
         content=user_input
     )
 
-    agent = get_agent(user_id=str(current_user.user_id))
+    await remember_user_facts(
+        user_id=str(current_user.user_id),
+        text=user_input,
+        source_message_id=user_message.message_id
+    )
+    context_prompt, model_messages = await _build_agent_messages(current_user, conversation, user_message)
+    agent = get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
     full_response = ""
     try:
         async for event in agent.astream_events(
-            {"messages": [{"role": "user", "content": user_input}]},
+            {"messages": model_messages},
             version="v1",
         ):
-            # 仅在模型逐token输出事件时推送到前端
             ev = event.get("event")
             if ev in ("on_chat_model_stream", "on_llm_stream"):
                 content_part = _extract_text_from_chunk(event["data"]["chunk"])
@@ -254,10 +330,9 @@ async def stream_generator(chat_request: ChatRequest, current_user: User, conver
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
         return
 
-    # 保存完整的模型响应
     if not full_response:
         try:
-            final = await agent.ainvoke({"messages": [{"role": "user", "content": user_input}]})
+            final = await agent.ainvoke({"messages": model_messages})
             text = _extract_text_from_agent_result(final)
             if text:
                 full_response = text
@@ -278,6 +353,7 @@ async def chat(
     chat_request: ChatRequest,
     current_user: User = Depends(get_current_user)
 ):
+    """流式聊天入口，返回 text/event-stream。"""
     if not chat_request.messages:
         raise HTTPException(status_code=400, detail="消息列表不能为空")
 
@@ -306,6 +382,7 @@ async def chat_sync(
     chat_request: ChatRequest,
     current_user: User = Depends(get_current_user)
 ):
+    """非流式聊天入口，返回一次性完整回答。"""
     if not chat_request.messages:
         raise HTTPException(status_code=400, detail="消息列表不能为空")
 
@@ -317,16 +394,21 @@ async def chat_sync(
         conversation = await Conversation.create(user=current_user)
 
     user_input = chat_request.messages[-1].content
-    await Message.create(
+    user_message = await Message.create(
         conversation=conversation,
         user=current_user,
         role="user",
         content=user_input
     )
-
-    agent = get_agent(user_id=str(current_user.user_id))
+    await remember_user_facts(
+        user_id=str(current_user.user_id),
+        text=user_input,
+        source_message_id=user_message.message_id
+    )
+    context_prompt, model_messages = await _build_agent_messages(current_user, conversation, user_message)
+    agent = get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
     try:
-        result = await agent.ainvoke({"messages": [{"role": "user", "content": user_input}]})
+        result = await agent.ainvoke({"messages": model_messages})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
