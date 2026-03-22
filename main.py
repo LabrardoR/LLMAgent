@@ -13,7 +13,7 @@ from app.api import knowledge as knowledge_api
 from contextlib import asynccontextmanager
 import os
 from pydantic import BaseModel
-
+from pathlib import Path
 from app.core.security import get_current_user
 from app.agent.agent import (
     AVAILABLE_MODELS,
@@ -43,7 +43,10 @@ from fastapi.staticfiles import StaticFiles
 app.include_router(user_api.router, prefix="/api/user", tags=["用户"])
 app.include_router(chat_api.router, prefix="/api/chat", tags=["聊天"])
 app.include_router(knowledge_api.router, prefix="/api/knowledge", tags=["知识库"])
-app.mount("/static", StaticFiles(directory=os.path.join("app", "static")), name="static")
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "app" / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 class ModelSelectRequest(BaseModel):
@@ -65,10 +68,10 @@ async def list_models():
 async def select_model(payload: ModelSelectRequest, current_user=Depends(get_current_user)):
     """为当前用户切换默认使用模型。"""
     try:
-        set_selected_model(str(current_user.user_id), payload.model_name)
+        await set_selected_model(str(current_user.user_id), payload.model_name)
     except ValueError:
         raise HTTPException(status_code=400, detail="不支持的模型")
-    return {"model_name": get_selected_model(str(current_user.user_id))}
+    return {"model_name": await get_selected_model(str(current_user.user_id))}
 
 
 @app.get("/api/tools", summary="获取工具列表")
@@ -81,10 +84,11 @@ async def list_tools(current_user=Depends(get_current_user)):
 async def toggle_tool(payload: ToolToggleRequest, current_user=Depends(get_current_user)):
     """切换当前用户的工具开关状态。"""
     try:
-        set_tool_enabled(str(current_user.user_id), payload.tool_name, payload.enabled)
+        await set_tool_enabled(str(current_user.user_id), payload.tool_name, payload.enabled)
     except ValueError:
         raise HTTPException(status_code=400, detail="不支持的工具")
-    return {"tool_name": payload.tool_name, "enabled": bool(get_tools_enabled(str(current_user.user_id)).get(payload.tool_name, True))}
+    enabled_tools = await get_tools_enabled(str(current_user.user_id))
+    return {"tool_name": payload.tool_name, "enabled": bool(enabled_tools.get(payload.tool_name, True))}
 
 
 @app.post("/api/tools/reload", summary="重载扩展工具")

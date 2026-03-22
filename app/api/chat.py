@@ -161,9 +161,17 @@ async def regenerate(
     await Message.filter(conversation=conversation, created_time__gt=base_message.created_time).delete()
 
     context_prompt, model_messages = await _build_agent_messages(current_user, conversation, base_message)
-    agent = get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+
+    # 将消息列表转换为单个输入字符串
+    user_input = base_message.content
+    chat_history = model_messages[:-1] if len(model_messages) > 1 else []
+
     try:
-        result = await agent.ainvoke({"messages": model_messages})
+        result = await agent.ainvoke({
+            "input": user_input,
+            "chat_history": chat_history
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -195,11 +203,18 @@ def _extract_text_from_agent_result(result) -> str:
     兼容不同 LangChain 返回结构，尽量提取纯文本内容。
 
     该函数用于同步返回与流式失败回退路径，避免因返回格式变化导致解析失败。
+    AgentExecutor 返回格式: {"input": ..., "output": ..., "chat_history": ...}
     """
     if isinstance(result, str):
         return result
     if isinstance(result, dict):
-        msgs = result.get("messages") or result.get("output") or result.get("output_messages") or []
+        # AgentExecutor 返回的 output 字段
+        if "output" in result:
+            output = result["output"]
+            return output if isinstance(output, str) else str(output)
+
+        # 兼容旧格式
+        msgs = result.get("messages") or result.get("output_messages") or []
         if isinstance(msgs, list) and msgs:
             last = msgs[-1]
             if isinstance(last, dict):
@@ -313,15 +328,19 @@ async def stream_generator(chat_request: ChatRequest, current_user: User, conver
         source_message_id=user_message.message_id
     )
     context_prompt, model_messages = await _build_agent_messages(current_user, conversation, user_message)
-    agent = get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+
+    # 提取用户输入和历史消息
+    chat_history = model_messages[:-1] if len(model_messages) > 1 else []
+
     full_response = ""
     try:
         async for event in agent.astream_events(
-            {"messages": model_messages},
-            version="v1",
+            {"input": user_input, "chat_history": chat_history},
+            version="v2",
         ):
-            ev = event.get("event")
-            if ev in ("on_chat_model_stream", "on_llm_stream"):
+            kind = event.get("event")
+            if kind in ("on_chat_model_stream", "on_llm_stream"):
                 content_part = _extract_text_from_chunk(event["data"]["chunk"])
                 if content_part:
                     full_response += content_part
@@ -332,7 +351,10 @@ async def stream_generator(chat_request: ChatRequest, current_user: User, conver
 
     if not full_response:
         try:
-            final = await agent.ainvoke({"messages": model_messages})
+            final = await agent.ainvoke({
+                "input": user_input,
+                "chat_history": chat_history
+            })
             text = _extract_text_from_agent_result(final)
             if text:
                 full_response = text
@@ -406,9 +428,16 @@ async def chat_sync(
         source_message_id=user_message.message_id
     )
     context_prompt, model_messages = await _build_agent_messages(current_user, conversation, user_message)
-    agent = get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+
+    # 提取用户输入和历史消息
+    chat_history = model_messages[:-1] if len(model_messages) > 1 else []
+
     try:
-        result = await agent.ainvoke({"messages": model_messages})
+        result = await agent.ainvoke({
+            "input": user_input,
+            "chat_history": chat_history
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -13,6 +13,8 @@ DB_CONFIG = {
         "models": {
             "models": [
                 "app.models.user",
+                "app.models.user_config",
+                "app.models.revoked_token",
                 "app.models.conversation",
                 "app.models.message",
                 "app.models.long_memory",
