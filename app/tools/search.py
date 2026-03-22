@@ -1,3 +1,6 @@
+"""
+app/tools/search.py
+"""
 from langchain.tools import tool
 from duckduckgo_search import DDGS
 
