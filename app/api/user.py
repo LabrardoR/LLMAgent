@@ -12,6 +12,7 @@ from app.core.security import (
     get_current_user,
     oauth2_scheme,
     revoke_token,
+    validate_password_strength,
 )
 
 router = APIRouter()
@@ -27,14 +28,19 @@ async def register_user(user_in: UserCreate):
     if await User.exists(account=user_in.account):
         raise HTTPException(status_code=400, detail="账户已存在")
 
+    # 验证密码强度
+    is_valid, error_msg = validate_password_strength(user_in.password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
     hashed_password = get_password_hash(user_in.password)
     user = await User.create(account=user_in.account, password=hashed_password)
-    
+
     access_token = create_access_token(subject=user.user_id)
     user_out = UserOut.model_validate(user)
-    
+
     return {
-        "access_token": access_token, 
+        "access_token": access_token,
         "token_type": "bearer",
         "user": user_out.dict()
     }
@@ -88,6 +94,11 @@ async def update_password(
     if payload.old_password == payload.new_password:
         raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
 
+    # 验证新密码强度
+    is_valid, error_msg = validate_password_strength(payload.new_password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
     current_user.password = get_password_hash(payload.new_password)
     await current_user.save()
     return {"message": "密码已更新"}
@@ -95,32 +106,44 @@ async def update_password(
 
 @router.post("/logout", summary="用户登出")
 async def logout(token: str = Depends(oauth2_scheme)):
-    revoke_token(token)
+    await revoke_token(token)
     return {"message": "已登出"}
 
 
 @router.post("/avatar", response_model=UserOut, summary="上传头像")
 async def upload_avatar(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user)
 ):
-    filename = file.filename or ""
-    ext = Path(filename).suffix.lower()
-    allowed = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-    if ext not in allowed:
-        raise HTTPException(status_code=400, detail="不支持的文件类型")
+    """
+    上传用户头像:
+    - **file**: 头像文件（支持 jpg, png 格式）
+    """
+    # 检查文件类型
+    if file.content_type not in ["image/jpeg", "image/png"]:
+        raise HTTPException(status_code=400, detail="只支持 jpg 和 png 格式的图片")
 
-    static_root = Path("app") / "static" / "avatars"
-    os.makedirs(static_root, exist_ok=True)
+    # 获取文件扩展名
+    if '.' in file.filename:
+        ext = file.filename.split('.')[-1].lower()
+    else:
+        ext = 'jpg'  # 默认扩展名
 
-    avatar_name = f"{current_user.user_id}.{uuid.uuid4().hex}{ext}"
-    avatar_path = static_root / avatar_name
+    # 生成唯一文件名
+    filename = f"{current_user.user_id}.{uuid.uuid4().hex}.{ext}"
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="空文件")
-    avatar_path.write_bytes(content)
+    # 确保目录存在
+    avatar_dir = Path("app/static/avatars")
+    avatar_dir.mkdir(parents=True, exist_ok=True)
 
-    current_user.photo_url = f"/static/avatars/{avatar_name}"
+    # 保存文件
+    file_path = avatar_dir / filename
+    with open(file_path, 'wb') as f:
+        content = await file.read()
+        f.write(content)
+
+    photo_url = f"/static/avatars/{filename}"
+    current_user.photo_url = photo_url
     await current_user.save()
+
     return current_user

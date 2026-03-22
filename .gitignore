@@ -25,3 +25,7 @@ Desktop.ini
 *.log
 node_modules/
 .python-version
+./src/pyproject.toml
+./src/poetry.lock
+./src/templates/
+app/static/
