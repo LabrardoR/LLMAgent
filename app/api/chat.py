@@ -10,6 +10,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
+import logging
 
 from app.schemas.chat import (
     ChatRequest,
@@ -30,6 +31,7 @@ from app.memory.short_memory import get_recent_messages
 from app.rag.service import build_rag_context
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/conversations", response_model=List[ConversationOut], summary="获取当前用户的所有会话")
@@ -111,7 +113,8 @@ async def update_message(
         raise HTTPException(status_code=404, detail="消息不存在")
     message.content = payload.content
     await message.save()
-    await Message.filter(conversation=message.conversation, created_time__gt=message.created_time).delete()
+    naive_time = message.created_time.replace(tzinfo=None)
+    await Message.filter(conversation=message.conversation, created_time__gt=naive_time).delete()
     return {"message": "消息已更新"}
 
 
@@ -153,19 +156,22 @@ async def regenerate(
             conversation=conversation,
             user=current_user,
             role="user",
-            created_time__lt=message.created_time,
+            created_time__lt=message.created_time.replace(tzinfo=None),
         ).order_by("-created_time").first()
         if not base_message:
             raise HTTPException(status_code=400, detail="找不到可重新生成的用户消息")
 
-    await Message.filter(conversation=conversation, created_time__gt=base_message.created_time).delete()
+    naive_base_time = base_message.created_time.replace(tzinfo=None)
+    await Message.filter(conversation=conversation, created_time__gt=naive_base_time).delete()
 
-    context_prompt, model_messages = await _build_agent_messages(current_user, conversation, base_message)
+    # 构建上下文和历史消息
+    context_prompt, chat_history = await _build_agent_messages(current_user, conversation, base_message)
+
+    # 创建agent（context_prompt会被注入到system prompt中）
     agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
 
-    # 将消息列表转换为单个输入字符串
+    # 用户输入
     user_input = base_message.content
-    chat_history = model_messages[:-1] if len(model_messages) > 1 else []
 
     try:
         result = await agent.ainvoke({
@@ -254,28 +260,50 @@ async def _build_agent_messages(
     输入由三部分组成：
     1) 知识库检索上下文（RAG）；
     2) 长期记忆召回内容；
-    3) 会话短期历史 + 当前用户输入。
+    3) 会话短期历史（不包含当前用户消息）。
+
+    返回：
+    - context_prompt: 包含RAG和长期记忆的上下文，将被注入到agent的system prompt中
+    - history: 历史对话消息列表（不包含system消息，不包含当前用户消息）
     """
     user_id = str(current_user.user_id)
+    conversation_id = str(conversation.conversation_id)
+
+    logger.info(f"Building agent messages for user {user_id}, conversation {conversation_id}")
+
+    # 获取历史消息（当前消息之前的对话历史）
     history = await get_recent_messages(
-        conversation_id=str(conversation.conversation_id),
+        conversation_id=conversation_id,
         limit=10,
         before_time=user_message.created_time
     )
+    logger.info(f"Retrieved {len(history)} historical messages")
+
+    # 构建RAG上下文
     rag_context = await build_rag_context(user_id=user_id, query=user_message.content, top_k=4)
+    if rag_context:
+        logger.info(f"RAG context retrieved: {len(rag_context)} characters")
+
+    # 召回长期记忆
     long_memories = await search_long_memory(user_id=user_id, query=user_message.content, top_k=3)
+    if long_memories:
+        logger.info(f"Recalled {len(long_memories)} long-term memories")
+
+    # 组装上下文提示（将作为system prompt的一部分）
     context_blocks = []
     if rag_context:
-        context_blocks.append(f"知识库检索结果:\n{rag_context}")
+        context_blocks.append(f"【知识库检索结果】\n{rag_context}")
     if long_memories:
-        context_blocks.append("长期记忆:\n" + "\n".join(long_memories))
+        context_blocks.append("【长期记忆】\n" + "\n".join(f"- {mem}" for mem in long_memories))
+
     context_prompt = "\n\n".join(context_blocks)
-    messages = []
+
     if context_prompt:
-        messages.append({"role": "system", "content": context_prompt})
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_message.content})
-    return context_prompt, messages
+        logger.debug(f"Context prompt length: {len(context_prompt)} characters")
+
+    # 返回上下文和历史消息
+    # 注意：不包含system消息（会由agent内部添加），不包含当前用户消息（会由调用方传入）
+    return context_prompt, history
 
 async def stream_generator(chat_request: ChatRequest, current_user: User, conversation: Conversation, created_new: bool):
     """
@@ -327,11 +355,12 @@ async def stream_generator(chat_request: ChatRequest, current_user: User, conver
         text=user_input,
         source_message_id=user_message.message_id
     )
-    context_prompt, model_messages = await _build_agent_messages(current_user, conversation, user_message)
-    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
 
-    # 提取用户输入和历史消息
-    chat_history = model_messages[:-1] if len(model_messages) > 1 else []
+    # 构建上下文和历史消息
+    context_prompt, chat_history = await _build_agent_messages(current_user, conversation, user_message)
+
+    # 创建agent（context_prompt会被注入到system prompt中）
+    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
 
     full_response = ""
     try:
@@ -427,11 +456,12 @@ async def chat_sync(
         text=user_input,
         source_message_id=user_message.message_id
     )
-    context_prompt, model_messages = await _build_agent_messages(current_user, conversation, user_message)
-    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
 
-    # 提取用户输入和历史消息
-    chat_history = model_messages[:-1] if len(model_messages) > 1 else []
+    # 构建上下文和历史消息
+    context_prompt, chat_history = await _build_agent_messages(current_user, conversation, user_message)
+
+    # 创建agent（context_prompt会被注入到system prompt中）
+    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
 
     try:
         result = await agent.ainvoke({

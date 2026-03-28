@@ -9,6 +9,7 @@ from app.config.db_config import init_db
 from app.api import user as user_api
 from app.api import chat as chat_api
 from app.api import knowledge as knowledge_api
+from app.api import memory as memory_api
 
 from contextlib import asynccontextmanager
 import os
@@ -43,6 +44,7 @@ from fastapi.staticfiles import StaticFiles
 app.include_router(user_api.router, prefix="/api/user", tags=["用户"])
 app.include_router(chat_api.router, prefix="/api/chat", tags=["聊天"])
 app.include_router(knowledge_api.router, prefix="/api/knowledge", tags=["知识库"])
+app.include_router(memory_api.router, prefix="/api/memory", tags=["记忆管理"])
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "app" / "static"
