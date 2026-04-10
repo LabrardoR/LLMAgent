@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run:*)",
+      "Bash(C:\\\\Users\\\\head\\\\.conda\\\\envs\\\\llm\\\\Scripts\\\\pip.exe install:*)",
+      "Bash(\"/c/Users/head/.conda/envs/llm/Scripts/pip.exe\" install:*)"
+    ]
+  }
+}

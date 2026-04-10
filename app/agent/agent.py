@@ -66,7 +66,7 @@ def reload_extension_tools() -> list[dict]:
     return get_available_tools()
 
 
-def _builtin_tools(user_id: str = None) -> dict[str, BaseTool]:
+def _builtin_tools(user_id: str | None = None) -> dict[str, BaseTool]:
     """
     构建内置工具集合。
 
@@ -192,7 +192,7 @@ async def set_tool_enabled(user_id: str, tool_name: str, enabled: bool) -> None:
         )
 
 
-async def get_agent(user_id: str = None, context_prompt: str = ""):
+async def get_agent(user_id: str | None = None, context_prompt: str = ""):
     """
     组装可执行的 Agent 实例。
 
@@ -215,7 +215,7 @@ async def get_agent(user_id: str = None, context_prompt: str = ""):
         if enabled.get(name, True):
             tools.append(tool)
 
-    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "")
     llm = ChatTongyi(
         model=model_name,
         dashscope_api_key=dashscope_api_key,

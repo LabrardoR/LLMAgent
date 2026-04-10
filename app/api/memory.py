@@ -23,7 +23,7 @@ router = APIRouter()
 
 @router.get("/long-memories", response_model=List[LongMemoryOut], summary="获取所有长期记忆")
 async def get_long_memories(
-    memory_type: str = None,
+    memory_type: str | None = None,
     current_user: User = Depends(get_current_user)
 ):
     """
@@ -184,7 +184,7 @@ async def delete_long_memory(
 
 @router.delete("/long-memories", summary="清空所有长期记忆")
 async def clear_long_memories(
-    memory_type: str = None,
+    memory_type: str | None = None,
     current_user: User = Depends(get_current_user)
 ):
     """

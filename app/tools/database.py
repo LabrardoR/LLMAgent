@@ -7,7 +7,7 @@ from app.models.user import User
 
 
 @tool
-async def database_tool(query: str, user_id: str = None) -> str:
+async def database_tool(query: str, user_id: str | None = None) -> str:
     """
     一个数据库工具，可以用来查询当前用户的聊天历史记录。
     当用户问'我上次说了什么'或类似问题时，使用此工具。

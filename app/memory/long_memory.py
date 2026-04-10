@@ -74,8 +74,8 @@ async def extract_long_term_facts_with_llm(text: str) -> list[tuple[str, str]]:
 
         llm = ChatTongyi(
             model="qwen-turbo",
-            dashscope_api_key=api_key,
-            temperature=0.1,
+            dashscope_api_key=api_key, # type: ignore
+            temperature=0.1, # type: ignore
         )
 
         prompt = f"""从以下用户输入中提取长期记忆信息。只提取明确的个人信息。
