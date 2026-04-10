@@ -14,19 +14,30 @@ import json
 from pathlib import Path
 
 TEXT_FILE_SUFFIXES = {".txt", ".md", ".csv", ".json", ".log"}
+PDF_FILE_SUFFIXES = {".pdf"}
+SUPPORTED_SUFFIXES = TEXT_FILE_SUFFIXES | PDF_FILE_SUFFIXES
+
+
+def _load_pdf(path: Path) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n\n".join(pages)
 
 
 def load_text_from_file(file_path: str) -> str:
     """
     从文件中读取文本内容。
 
-    - 限定为文本类后缀，避免将二进制文件误当文本读取；
+    - 支持 txt/md/csv/json/log 文本文件及 pdf；
     - JSON 文件会优先尝试解析并规范化，提升后续切分与检索质量。
     """
     path = Path(file_path)
     suffix = path.suffix.lower()
-    if suffix not in TEXT_FILE_SUFFIXES:
-        raise ValueError("仅支持 txt/md/csv/json/log 文本文件")
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise ValueError("仅支持 txt/md/csv/json/log/pdf 文件")
+    if suffix == ".pdf":
+        return _load_pdf(path)
     raw = path.read_text(encoding="utf-8", errors="ignore")
     if suffix == ".json":
         try:

@@ -104,7 +104,7 @@ async def extract_long_term_facts_with_llm(text: str) -> list[tuple[str, str]]:
         content = response.content if hasattr(response, 'content') else str(response)
 
         # 尝试解析JSON
-        content = content.strip()
+        content = content.strip() # type: ignore
         if content.startswith("```json"):
             content = content[7:]
         if content.startswith("```"):

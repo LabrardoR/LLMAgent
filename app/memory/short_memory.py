@@ -12,7 +12,7 @@ from app.models.message import Message
 logger = logging.getLogger(__name__)
 
 
-async def get_recent_messages(conversation_id: str, limit: int = 10, before_time: datetime = None) -> list[dict]:
+async def get_recent_messages(conversation_id: str, limit: int = 10, before_time: datetime = None) -> list[dict]: # type: ignore
     """
     获取会话最近消息，按时间正序返回。
 
@@ -55,7 +55,7 @@ async def get_recent_messages(conversation_id: str, limit: int = 10, before_time
         return []
 
 
-async def get_conversation_summary(conversation_id: str, max_tokens: int = 500) -> str:
+async def get_conversation_summary(conversation_id: str, max_tokens: int = 500) -> str: # type: ignore
     """
     获取会话摘要（可选功能，用于压缩长对话历史）。
 
