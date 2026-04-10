@@ -1,77 +1,351 @@
 """
 聊天 API。
 
-主要能力：
-1) 会话与消息管理（增删改查）；
-2) SSE 流式对话；
-3) 回答重生成；
-4) 将短期记忆、长期记忆、RAG 检索上下文统一注入 Agent 输入。
+能力：
+1. 会话和消息管理；
+2. SSE 聊天；
+3. 回答重新生成；
+4. 短期记忆、长期记忆、RAG 统一注入；
+5. 会话摘要、导出、分支、统计。
 """
 
-from fastapi import APIRouter, Depends, HTTPException
-from typing import List
-import logging
+from __future__ import annotations
 
+import json
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+
+from app.agent.agent import get_agent
+from app.core.security import get_current_user
+from app.memory.long_memory import remember_user_facts, search_long_memory
+from app.memory.short_memory import (
+    get_conversation_summary,
+    get_recent_messages,
+    suggest_conversation_title,
+)
+from app.models.conversation import Conversation
+from app.models.message import Message
+from app.models.user import User
+from app.rag.service import build_rag_payload
 from app.schemas.chat import (
     ChatRequest,
-    ConversationOut,
-    MessageOut,
-    ConversationUpdate,
+    ConversationBranchRequest,
     ConversationCreate,
+    ConversationOut,
+    ConversationUpdate,
+    MessageOut,
     MessageUpdate,
     RegenerateRequest,
 )
-from app.models.user import User
-from app.models.conversation import Conversation
-from app.models.message import Message
-from app.core.security import get_current_user
-from app.agent.agent import get_agent
-from app.memory.long_memory import remember_user_facts, search_long_memory
-from app.memory.short_memory import get_recent_messages
-from app.rag.service import build_rag_context
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
 
-@router.get("/conversations", response_model=List[ConversationOut], summary="获取当前用户的所有会话")
+def _extract_text_from_agent_result(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        output = result.get("output")
+        if isinstance(output, str):
+            return output
+        if output is not None:
+            return str(output)
+        content = result.get("content")
+        if isinstance(content, str):
+            return content
+        if content is not None:
+            return str(content)
+        return ""
+    content = getattr(result, "content", "")
+    return content if isinstance(content, str) else str(content)
+
+
+def _extract_text_from_chunk(chunk: Any) -> str:
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    text_parts.append(str(text))
+        return "".join(text_parts)
+    return str(content)
+
+
+async def _get_active_conversation(conversation_id: str, current_user: User) -> Conversation:
+    conversation = await Conversation.get_or_none(
+        conversation_id=conversation_id,
+        user=current_user,
+        status=1,
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return conversation
+
+
+async def _build_agent_messages(
+    current_user: User,
+    conversation: Conversation,
+    user_message: Message,
+    group_name: str | None = None,
+    tag: str | None = None,
+) -> tuple[str, list[dict[str, str]], list[dict[str, Any]]]:
+    history = await get_recent_messages(
+        conversation_id=str(conversation.conversation_id),
+        limit=10,
+        before_time=user_message.created_time,
+    )
+    rag_payload = await build_rag_payload(
+        user_id=str(current_user.user_id),
+        query=user_message.content,
+        top_k=4,
+        group_name=group_name,
+        tag=tag,
+    )
+    long_memories = await search_long_memory(
+        user_id=str(current_user.user_id),
+        query=user_message.content,
+        top_k=3,
+    )
+
+    context_parts: list[str] = []
+    if rag_payload["context"]:
+        context_parts.append(f"【知识库检索结果】\n{rag_payload['context']}")
+    if long_memories:
+        context_parts.append("【长期记忆】\n" + "\n".join(f"- {item}" for item in long_memories))
+
+    context_prompt = "\n\n".join(context_parts)
+    return context_prompt, history, rag_payload["references"]
+
+
+async def _maybe_update_conversation_title(conversation: Conversation, user_input: str) -> None:
+    if conversation.title and conversation.title != "新对话":
+        return
+    conversation.title = suggest_conversation_title(user_input)
+    await conversation.save()
+
+
+async def _save_assistant_message(
+    conversation: Conversation,
+    current_user: User,
+    content: str,
+) -> Message | None:
+    if not content:
+        return None
+    return await Message.create(
+        conversation=conversation,
+        user=current_user,
+        role="assistant",
+        content=content,
+    )
+
+
+def _build_chat_response(
+    conversation: Conversation,
+    content: str,
+    references: list[dict[str, Any]],
+    agent_result: dict[str, Any],
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "conversation_id": str(conversation.conversation_id),
+        "message_id": message_id,
+        "content": content,
+        "references": references,
+        "tool_calls": agent_result.get("tool_calls", []),
+        "selected_model": agent_result.get("selected_model"),
+        "resolved_model": agent_result.get("resolved_model"),
+        "duration_ms": agent_result.get("duration_ms", 0),
+    }
+
+
+async def _run_agent_for_message(
+    chat_request: ChatRequest,
+    current_user: User,
+    conversation: Conversation,
+    user_message: Message,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    context_prompt, chat_history, references = await _build_agent_messages(
+        current_user=current_user,
+        conversation=conversation,
+        user_message=user_message,
+        group_name=chat_request.group_name,
+        tag=chat_request.tag,
+    )
+    agent = await get_agent(
+        user_id=str(current_user.user_id),
+        context_prompt=context_prompt,
+        conversation_id=str(conversation.conversation_id),
+        message_id=str(user_message.message_id),
+        reference_count=len(references),
+    )
+    result = await agent.ainvoke(
+        {
+            "input": user_message.content,
+            "chat_history": chat_history,
+        }
+    )
+    return result, references
+
+
+@router.get("/conversations", response_model=list[ConversationOut], summary="获取当前用户的所有会话")
 async def get_user_conversations(current_user: User = Depends(get_current_user)):
-    conversations = await Conversation.filter(user=current_user, status=1).order_by("-created_time")
-    return conversations
+    return await Conversation.filter(user=current_user, status=1).order_by("-updated_time")
 
 
 @router.post("/conversations", summary="创建新会话")
 async def create_conversation(
     payload: ConversationCreate,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     conversation = await Conversation.create(user=current_user, title=payload.title)
     return {"conversation_id": str(conversation.conversation_id)}
 
 
-@router.get("/conversations/{conversation_id}", response_model=List[MessageOut], summary="获取单个会话的所有消息")
+@router.get("/conversations/{conversation_id}", response_model=list[MessageOut], summary="获取单个会话的所有消息")
 async def get_conversation_messages(
     conversation_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    conversation = await Conversation.get_or_none(conversation_id=conversation_id, user=current_user)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    
+    conversation = await _get_active_conversation(conversation_id, current_user)
+    return await Message.filter(conversation=conversation).order_by("created_time")
+
+
+@router.get("/conversations/{conversation_id}/summary", summary="获取会话摘要")
+async def conversation_summary(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    conversation = await _get_active_conversation(conversation_id, current_user)
+    summary = await get_conversation_summary(str(conversation.conversation_id))
+    return {
+        "conversation_id": str(conversation.conversation_id),
+        "title": conversation.title,
+        "summary": summary,
+    }
+
+
+@router.get("/conversations/{conversation_id}/stats", summary="获取会话统计信息")
+async def conversation_stats(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    from app.models.chat_run_log import ChatRunLog
+    from app.models.tool_call_log import ToolCallLog
+
+    conversation = await _get_active_conversation(conversation_id, current_user)
     messages = await Message.filter(conversation=conversation).order_by("created_time")
-    return messages
+    run_logs = await ChatRunLog.filter(conversation=conversation).order_by("-created_time")
+    tool_logs = await ToolCallLog.filter(conversation=conversation).order_by("-created_time")
+
+    user_count = len([item for item in messages if item.role == "user"])
+    assistant_count = len([item for item in messages if item.role == "assistant"])
+    avg_duration = round(sum(item.duration_ms for item in run_logs) / len(run_logs), 2) if run_logs else 0
+
+    return {
+        "conversation_id": str(conversation.conversation_id),
+        "title": conversation.title,
+        "message_count": len(messages),
+        "user_message_count": user_count,
+        "assistant_message_count": assistant_count,
+        "tool_call_count": len(tool_logs),
+        "avg_duration_ms": avg_duration,
+        "last_message_time": messages[-1].created_time if messages else None,
+        "summary": await get_conversation_summary(str(conversation.conversation_id)),
+    }
+
+
+@router.get("/conversations/{conversation_id}/export", summary="导出会话")
+async def export_conversation(
+    conversation_id: str,
+    format: str = "markdown",
+    current_user: User = Depends(get_current_user),
+):
+    conversation = await _get_active_conversation(conversation_id, current_user)
+    messages = await Message.filter(conversation=conversation).order_by("created_time")
+
+    if format == "json":
+        return JSONResponse(
+            {
+                "conversation_id": str(conversation.conversation_id),
+                "title": conversation.title,
+                "messages": [
+                    {
+                        "message_id": str(item.message_id),
+                        "role": item.role,
+                        "content": item.content,
+                        "created_time": item.created_time.isoformat(),
+                    }
+                    for item in messages
+                ],
+            }
+        )
+
+    if format == "text":
+        content = "\n\n".join(f"[{item.role}] {item.content}" for item in messages)
+        return PlainTextResponse(content)
+
+    lines = [f"# {conversation.title}", ""]
+    for item in messages:
+        lines.append(f"## {item.role}")
+        lines.append(item.content)
+        lines.append("")
+    return PlainTextResponse("\n".join(lines), media_type="text/markdown")
+
+
+@router.post("/conversations/{conversation_id}/branch", summary="创建分支会话")
+async def branch_conversation(
+    conversation_id: str,
+    payload: ConversationBranchRequest,
+    current_user: User = Depends(get_current_user),
+):
+    conversation = await _get_active_conversation(conversation_id, current_user)
+    messages_query = Message.filter(conversation=conversation).order_by("created_time")
+    source_messages = await messages_query
+
+    if payload.message_id:
+        target = await Message.get_or_none(
+            message_id=payload.message_id,
+            conversation=conversation,
+            user=current_user,
+        )
+        if not target:
+            raise HTTPException(status_code=404, detail="消息不存在")
+
+        filtered: list[Message] = []
+        cutoff = target.created_time.replace(tzinfo=None)
+        for item in source_messages:
+            created_time = item.created_time.replace(tzinfo=None) if item.created_time.tzinfo else item.created_time
+            if created_time <= cutoff:
+                filtered.append(item)
+        source_messages = filtered
+
+    new_conversation = await Conversation.create(user=current_user, title=payload.title)
+    for item in source_messages:
+        await Message.create(
+            conversation=new_conversation,
+            user=current_user,
+            role=item.role,
+            content=item.content,
+            message_type=item.message_type,
+            tokens=item.tokens,
+        )
+
+    return {"conversation_id": str(new_conversation.conversation_id)}
 
 
 @router.put("/conversations/{conversation_id}", summary="修改会话标题")
 async def update_conversation_title(
     conversation_id: str,
     update_data: ConversationUpdate,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    conversation = await Conversation.get_or_none(conversation_id=conversation_id, user=current_user)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    
+    conversation = await _get_active_conversation(conversation_id, current_user)
     conversation.title = update_data.title
     await conversation.save()
     return {"message": "会话标题已更新"}
@@ -80,11 +354,9 @@ async def update_conversation_title(
 @router.delete("/conversations/{conversation_id}", summary="删除会话")
 async def delete_conversation(
     conversation_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    conversation = await Conversation.get_or_none(conversation_id=conversation_id, user=current_user, status=1)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="会话不存在")
+    conversation = await _get_active_conversation(conversation_id, current_user)
     conversation.status = 0
     await conversation.save()
     return {"message": "会话已删除"}
@@ -93,11 +365,9 @@ async def delete_conversation(
 @router.delete("/conversations/{conversation_id}/messages", summary="清空会话")
 async def clear_conversation_messages(
     conversation_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    conversation = await Conversation.get_or_none(conversation_id=conversation_id, user=current_user, status=1)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="会话不存在")
+    conversation = await _get_active_conversation(conversation_id, current_user)
     await Message.filter(conversation=conversation).delete()
     return {"message": "会话已清空"}
 
@@ -106,24 +376,29 @@ async def clear_conversation_messages(
 async def update_message(
     message_id: str,
     payload: MessageUpdate,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    message = await Message.get_or_none(message_id=message_id, user=current_user)
+    message = await Message.get_or_none(message_id=message_id, user=current_user, conversation__status=1)
     if not message:
         raise HTTPException(status_code=404, detail="消息不存在")
+
     message.content = payload.content
     await message.save()
-    naive_time = message.created_time.replace(tzinfo=None)
-    await Message.filter(conversation=message.conversation, created_time__gt=naive_time).delete()
+
+    compare_time = message.created_time.replace(tzinfo=None) if message.created_time.tzinfo else message.created_time
+    await Message.filter(
+        conversation=message.conversation,
+        created_time__gt=compare_time,
+    ).delete()
     return {"message": "消息已更新"}
 
 
 @router.delete("/messages/{message_id}", summary="删除单条消息")
 async def delete_message(
     message_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    message = await Message.get_or_none(message_id=message_id, user=current_user)
+    message = await Message.get_or_none(message_id=message_id, user=current_user, conversation__status=1)
     if not message:
         raise HTTPException(status_code=404, detail="消息不存在")
     await message.delete()
@@ -133,286 +408,136 @@ async def delete_message(
 @router.post("/regenerate", summary="重新生成回答")
 async def regenerate(
     payload: RegenerateRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    基于历史某条用户消息重新生成回答。
-
-    策略：
-    - 删除该消息之后的所有消息，保证上下文一致；
-    - 重新构建“记忆 + 知识库 + 历史消息”输入后调用 Agent。
-    """
-    conversation = await Conversation.get_or_none(conversation_id=payload.conversation_id, user=current_user, status=1)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="会话不存在")
-
-    message = await Message.get_or_none(message_id=payload.message_id, user=current_user, conversation=conversation)
+    conversation = await _get_active_conversation(str(payload.conversation_id), current_user)
+    message = await Message.get_or_none(
+        message_id=payload.message_id,
+        user=current_user,
+        conversation=conversation,
+    )
     if not message:
         raise HTTPException(status_code=404, detail="消息不存在")
 
     base_message = message
     if base_message.role != "user":
+        compare_time = base_message.created_time.replace(tzinfo=None) if base_message.created_time.tzinfo else base_message.created_time
         base_message = await Message.filter(
             conversation=conversation,
             user=current_user,
             role="user",
-            created_time__lt=message.created_time.replace(tzinfo=None),
+            created_time__lt=compare_time,
         ).order_by("-created_time").first()
         if not base_message:
             raise HTTPException(status_code=400, detail="找不到可重新生成的用户消息")
 
-    naive_base_time = base_message.created_time.replace(tzinfo=None)
-    await Message.filter(conversation=conversation, created_time__gt=naive_base_time).delete()
+    compare_time = base_message.created_time.replace(tzinfo=None) if base_message.created_time.tzinfo else base_message.created_time
+    await Message.filter(conversation=conversation, created_time__gt=compare_time).delete()
 
-    # 构建上下文和历史消息
-    context_prompt, chat_history = await _build_agent_messages(current_user, conversation, base_message)
+    request = ChatRequest(
+        conversation_id=conversation.conversation_id,
+        messages=[{"role": "user", "content": base_message.content}],
+    )
+    agent_result, references = await _run_agent_for_message(
+        chat_request=request,
+        current_user=current_user,
+        conversation=conversation,
+        user_message=base_message,
+    )
+    content = _extract_text_from_agent_result(agent_result)
+    assistant_message = await _save_assistant_message(conversation, current_user, content)
 
-    # 创建agent（context_prompt会被注入到system prompt中）
-    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
-
-    # 用户输入
-    user_input = base_message.content
-
-    try:
-        result = await agent.ainvoke({
-            "input": user_input,
-            "chat_history": chat_history
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    content = _extract_text_from_agent_result(result)
-    new_message_id = None
-    if content:
-        new_msg = await Message.create(
-            conversation=conversation,
-            user=current_user,
-            role="assistant",
-            content=content
-        )
-        new_message_id = str(new_msg.message_id)
-
-    return {
-        "conversation_id": str(conversation.conversation_id),
-        "message_id": new_message_id,
-        "content": content
-    }
+    return _build_chat_response(
+        conversation=conversation,
+        content=content,
+        references=references,
+        agent_result=agent_result,
+        message_id=str(assistant_message.message_id) if assistant_message else None,
+    )
 
 
-from fastapi.responses import StreamingResponse
-
-
-import json
-
-def _extract_text_from_agent_result(result) -> str:
-    """
-    兼容不同 LangChain 返回结构，尽量提取纯文本内容。
-
-    该函数用于同步返回与流式失败回退路径，避免因返回格式变化导致解析失败。
-    AgentExecutor 返回格式: {"input": ..., "output": ..., "chat_history": ...}
-    """
-    if isinstance(result, str):
-        return result
-    if isinstance(result, dict):
-        # AgentExecutor 返回的 output 字段
-        if "output" in result:
-            output = result["output"]
-            return output if isinstance(output, str) else str(output)
-
-        # 兼容旧格式
-        msgs = result.get("messages") or result.get("output_messages") or []
-        if isinstance(msgs, list) and msgs:
-            last = msgs[-1]
-            if isinstance(last, dict):
-                content = last.get("content", "")
-                return content if isinstance(content, str) else str(content)
-            return getattr(last, "content", "") or ""
-        if isinstance(msgs, str):
-            return msgs
-        content = result.get("content")
-        if isinstance(content, str):
-            return content
-        if content is not None:
-            return str(content)
-        return ""
-    if hasattr(result, "content"):
-        content = getattr(result, "content")
-        if isinstance(content, str):
-            return content
-        if content is not None:
-            return str(content)
-    if hasattr(result, "get"):
-        msgs = result.get("messages", [])
-        if msgs:
-            last = msgs[-1]
-            return getattr(last, "content", "") or ""
-    return str(result) if result is not None else ""
-
-
-async def _build_agent_messages(
+async def stream_generator(
+    chat_request: ChatRequest,
     current_user: User,
     conversation: Conversation,
-    user_message: Message,
+    created_new: bool,
 ):
-    """
-    组装模型输入消息列表。
-
-    输入由三部分组成：
-    1) 知识库检索上下文（RAG）；
-    2) 长期记忆召回内容；
-    3) 会话短期历史（不包含当前用户消息）。
-
-    返回：
-    - context_prompt: 包含RAG和长期记忆的上下文，将被注入到agent的system prompt中
-    - history: 历史对话消息列表（不包含system消息，不包含当前用户消息）
-    """
-    user_id = str(current_user.user_id)
-    conversation_id = str(conversation.conversation_id)
-
-    logger.info(f"Building agent messages for user {user_id}, conversation {conversation_id}")
-
-    # 获取历史消息（当前消息之前的对话历史）
-    history = await get_recent_messages(
-        conversation_id=conversation_id,
-        limit=10,
-        before_time=user_message.created_time
-    )
-    logger.info(f"Retrieved {len(history)} historical messages")
-
-    # 构建RAG上下文
-    rag_context = await build_rag_context(user_id=user_id, query=user_message.content, top_k=4)
-    if rag_context:
-        logger.info(f"RAG context retrieved: {len(rag_context)} characters")
-
-    # 召回长期记忆
-    long_memories = await search_long_memory(user_id=user_id, query=user_message.content, top_k=3)
-    if long_memories:
-        logger.info(f"Recalled {len(long_memories)} long-term memories")
-
-    # 组装上下文提示（将作为system prompt的一部分）
-    context_blocks = []
-    if rag_context:
-        context_blocks.append(f"【知识库检索结果】\n{rag_context}")
-    if long_memories:
-        context_blocks.append("【长期记忆】\n" + "\n".join(f"- {mem}" for mem in long_memories))
-
-    context_prompt = "\n\n".join(context_blocks)
-
-    if context_prompt:
-        logger.debug(f"Context prompt length: {len(context_prompt)} characters")
-
-    # 返回上下文和历史消息
-    # 注意：不包含system消息（会由agent内部添加），不包含当前用户消息（会由调用方传入）
-    return context_prompt, history
-
-async def stream_generator(chat_request: ChatRequest, current_user: User, conversation: Conversation, created_new: bool):
-    """
-    SSE 事件生成器。
-
-    流程：
-    - 写入用户消息并尝试抽取长期记忆；
-    - 组装上下文并流式调用 Agent；
-    - 按 token 推送到前端；
-    - 对流式空输出场景进行同步回退；
-    - 最终持久化 assistant 消息。
-    """
-    def _extract_text_from_chunk(chunk) -> str:
-        try:
-            content = getattr(chunk, "content", None)
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                text = ""
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            text += part.get("text", "")
-                    else:
-                        t = getattr(part, "text", None)
-                        if t:
-                            text += t
-                return text
-            if content is not None:
-                return str(content)
-        except Exception:
-            pass
-        return ""
-
     if created_new:
         yield f"data: {json.dumps({'conversation_id': str(conversation.conversation_id)})}\n\n"
 
     user_input = chat_request.messages[-1].content
+    await _maybe_update_conversation_title(conversation, user_input)
 
     user_message = await Message.create(
         conversation=conversation,
         user=current_user,
         role="user",
-        content=user_input
+        content=user_input,
     )
-
     await remember_user_facts(
         user_id=str(current_user.user_id),
         text=user_input,
-        source_message_id=user_message.message_id
+        source_message_id=user_message.message_id,
     )
 
-    # 构建上下文和历史消息
-    context_prompt, chat_history = await _build_agent_messages(current_user, conversation, user_message)
-
-    # 创建agent（context_prompt会被注入到system prompt中）
-    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
+    context_prompt, chat_history, references = await _build_agent_messages(
+        current_user=current_user,
+        conversation=conversation,
+        user_message=user_message,
+        group_name=chat_request.group_name,
+        tag=chat_request.tag,
+    )
+    agent = await get_agent(
+        user_id=str(current_user.user_id),
+        context_prompt=context_prompt,
+        conversation_id=str(conversation.conversation_id),
+        message_id=str(user_message.message_id),
+        reference_count=len(references),
+    )
 
     full_response = ""
+    final_result: dict[str, Any] = {}
     try:
         async for event in agent.astream_events(
             {"input": user_input, "chat_history": chat_history},
             version="v2",
         ):
-            kind = event.get("event")
-            if kind in ("on_chat_model_stream", "on_llm_stream"):
-                content_part = _extract_text_from_chunk(event["data"]["chunk"])
-                if content_part:
-                    full_response += content_part
-                    yield f"data: {json.dumps({'content': content_part})}\n\n"
-    except Exception as e:
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            event_name = event.get("event")
+            if event_name in {"on_chat_model_stream", "on_llm_stream"}:
+                chunk_text = _extract_text_from_chunk(event["data"]["chunk"])
+                if not chunk_text:
+                    continue
+                full_response += chunk_text
+                yield f"data: {json.dumps({'content': chunk_text})}\n\n"
+            elif event_name == "on_chat_model_end":
+                final_result = event["data"].get("result", {})
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
         return
 
     if not full_response:
-        try:
-            final = await agent.ainvoke({
-                "input": user_input,
-                "chat_history": chat_history
-            })
-            text = _extract_text_from_agent_result(final)
-            if text:
-                full_response = text
-                yield f"data: {json.dumps({'content': text})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            return
-    if full_response:
-        await Message.create(
-            conversation=conversation,
-            user=current_user,
-            role="assistant",
-            content=full_response
-        )
+        full_response = _extract_text_from_agent_result(final_result)
+        if full_response:
+            yield f"data: {json.dumps({'content': full_response})}\n\n"
+
+    assistant_message = await _save_assistant_message(conversation, current_user, full_response)
+    yield f"data: {json.dumps({'references': references})}\n\n"
+    yield f"data: {json.dumps({'tool_calls': final_result.get('tool_calls', [])})}\n\n"
+    yield f"data: {json.dumps({'selected_model': final_result.get('selected_model'), 'resolved_model': final_result.get('resolved_model'), 'duration_ms': final_result.get('duration_ms', 0)})}\n\n"
+    yield f"data: {json.dumps({'message_id': str(assistant_message.message_id) if assistant_message else None, 'done': True})}\n\n"
+
 
 @router.post("/", summary="聊天")
 async def chat(
     chat_request: ChatRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """流式聊天入口，返回 text/event-stream。"""
     if not chat_request.messages:
         raise HTTPException(status_code=400, detail="消息列表不能为空")
 
     created_new = False
     if chat_request.conversation_id:
-        conversation = await Conversation.get_or_none(conversation_id=chat_request.conversation_id, user=current_user)
-        if not conversation:
-            raise HTTPException(status_code=404, detail="对话不存在")
+        conversation = await _get_active_conversation(str(chat_request.conversation_id), current_user)
     else:
         conversation = await Conversation.create(user=current_user)
         created_new = True
@@ -428,59 +553,47 @@ async def chat(
         headers=headers,
     )
 
+
 @router.post("/sync", summary="聊天(非流式)")
 async def chat_sync(
     chat_request: ChatRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """非流式聊天入口，返回一次性完整回答。"""
     if not chat_request.messages:
         raise HTTPException(status_code=400, detail="消息列表不能为空")
 
     if chat_request.conversation_id:
-        conversation = await Conversation.get_or_none(conversation_id=chat_request.conversation_id, user=current_user)
-        if not conversation:
-            raise HTTPException(status_code=404, detail="对话不存在")
+        conversation = await _get_active_conversation(str(chat_request.conversation_id), current_user)
     else:
         conversation = await Conversation.create(user=current_user)
 
     user_input = chat_request.messages[-1].content
+    await _maybe_update_conversation_title(conversation, user_input)
+
     user_message = await Message.create(
         conversation=conversation,
         user=current_user,
         role="user",
-        content=user_input
+        content=user_input,
     )
     await remember_user_facts(
         user_id=str(current_user.user_id),
         text=user_input,
-        source_message_id=user_message.message_id
+        source_message_id=user_message.message_id,
     )
 
-    # 构建上下文和历史消息
-    context_prompt, chat_history = await _build_agent_messages(current_user, conversation, user_message)
-
-    # 创建agent（context_prompt会被注入到system prompt中）
-    agent = await get_agent(user_id=str(current_user.user_id), context_prompt=context_prompt)
-
-    try:
-        result = await agent.ainvoke({
-            "input": user_input,
-            "chat_history": chat_history
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    content = _extract_text_from_agent_result(result)
-    if content:
-        await Message.create(
-            conversation=conversation,
-            user=current_user,
-            role="assistant",
-            content=content
-        )
-
-    return {
-        "conversation_id": str(conversation.conversation_id),
-        "content": content
-    }
+    agent_result, references = await _run_agent_for_message(
+        chat_request=chat_request,
+        current_user=current_user,
+        conversation=conversation,
+        user_message=user_message,
+    )
+    content = _extract_text_from_agent_result(agent_result)
+    assistant_message = await _save_assistant_message(conversation, current_user, content)
+    return _build_chat_response(
+        conversation=conversation,
+        content=content,
+        references=references,
+        agent_result=agent_result,
+        message_id=str(assistant_message.message_id) if assistant_message else None,
+    )

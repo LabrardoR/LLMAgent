@@ -42,7 +42,7 @@ async def register_user(user_in: UserCreate):
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": user_out.dict()
+        "user": user_out.model_dump()
     }
 
 
@@ -61,7 +61,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {
         "access_token": access_token, 
         "token_type": "bearer",
-        "user": user_out.dict()
+        "user": user_out.model_dump()
     }
 
 
@@ -124,7 +124,7 @@ async def upload_avatar(
         raise HTTPException(status_code=400, detail="只支持 jpg 和 png 格式的图片")
 
     # 获取文件扩展名
-    if '.' in file.filename:
+    if file.filename and '.' in file.filename:
         ext = file.filename.split('.')[-1].lower()
     else:
         ext = 'jpg'  # 默认扩展名
@@ -141,6 +141,12 @@ async def upload_avatar(
     with open(file_path, 'wb') as f:
         content = await file.read()
         f.write(content)
+
+    if current_user.photo_url:
+        old_name = current_user.photo_url.split("/")[-1]
+        old_path = avatar_dir / old_name
+        if old_path.exists() and old_path.is_file():
+            old_path.unlink()
 
     photo_url = f"/static/avatars/{filename}"
     current_user.photo_url = photo_url
