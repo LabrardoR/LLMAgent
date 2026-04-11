@@ -6,7 +6,7 @@ import ast
 import operator
 
 
-@tool
+@tool("calculator")
 def calculator_tool(expression: str) -> str:
     """
     一个简单的计算器工具，可以执行数学表达式。

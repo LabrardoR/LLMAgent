@@ -10,11 +10,25 @@ class KnowledgeDocumentOut(BaseModel):
     file_name: str
     chunk_count: int
     status: str
+    group_name: str = ""
+    tags: list[str] = []
+    description: str = ""
     created_time: datetime
 
-    model_config = {"from_attributes": True}
+
+class KnowledgeSearchItem(BaseModel):
+    document_id: str
+    title: str
+    chunk_index: int
+    score: float
+    snippet: str
+    content: str
+    group_name: str = ""
+    tags: list[str] = []
 
 
 class KnowledgeSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=1000)
     top_k: int = Field(4, ge=1, le=10)
+    group_name: str | None = None
+    tag: str | None = None

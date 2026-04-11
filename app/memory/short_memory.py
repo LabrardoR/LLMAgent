@@ -1,65 +1,71 @@
 """
 短期记忆模块。
 
-用于按会话维度读取最近对话历史，为模型提供多轮上下文。
+负责：
+1. 读取会话最近历史；
+2. 生成会话摘要；
+3. 生成默认标题建议。
 """
 
+from __future__ import annotations
+
 from datetime import datetime
-import logging
 
 from app.models.message import Message
 
-logger = logging.getLogger(__name__)
+
+async def get_recent_messages(
+    conversation_id: str,
+    limit: int = 10,
+    before_time: datetime | None = None,
+) -> list[dict[str, str]]:
+    filter_time = None
+    if before_time is not None:
+        filter_time = before_time.replace(tzinfo=None) if before_time.tzinfo else before_time
+
+    query = Message.filter(conversation_id=conversation_id).order_by("-created_time")
+    if filter_time is not None:
+        query = query.filter(created_time__lt=filter_time)
+
+    records = await query.limit(limit)
+    records = list(reversed(records))
+    return [{"role": item.role, "content": item.content} for item in records]
 
 
-async def get_recent_messages(conversation_id: str, limit: int = 10, before_time: datetime = None) -> list[dict]: # type: ignore
+def suggest_conversation_title(text: str, fallback: str = "新对话") -> str:
+    content = " ".join(text.strip().split())
+    if not content:
+        return fallback
+    title = content[:18]
+    if len(content) > 18:
+        title += "..."
+    return title
+
+
+async def get_conversation_summary(conversation_id: str, max_chars: int = 280) -> str:
     """
-    获取会话最近消息，按时间正序返回。
+    使用简单规则生成摘要。
 
-    参数：
-    - conversation_id: 会话ID
-    - limit: 最多返回的消息数量
-    - before_time: 若传入，仅返回该时间点之前的消息，常用于重生成场景。
-
-    返回：按时间正序排列的消息列表 [oldest, ..., newest]
+    这里不强依赖大模型，保证没有外部服务时也能工作。
     """
-    try:
-        # 处理时区问题：统一转换为naive datetime
-        filter_time = None
-        if before_time is not None:
-            filter_time = before_time.replace(tzinfo=None) if before_time.tzinfo else before_time
+    messages = await Message.filter(conversation_id=conversation_id).order_by("created_time")
+    if not messages:
+        return ""
 
-        # 查询消息：按创建时间倒序（最新的在前）
-        query = Message.filter(conversation_id=conversation_id).order_by("-created_time")
+    user_messages = [msg.content.strip() for msg in messages if msg.role == "user" and msg.content.strip()]
+    assistant_messages = [msg.content.strip() for msg in messages if msg.role == "assistant" and msg.content.strip()]
 
-        if filter_time is not None:
-            query = query.filter(created_time__lt=filter_time)
+    first_user = user_messages[0] if user_messages else ""
+    last_user = user_messages[-1] if user_messages else ""
+    last_answer = assistant_messages[-1] if assistant_messages else ""
 
-        # 获取最近的 limit 条消息
-        records = await query.limit(limit)
+    parts: list[str] = []
+    if first_user:
+        parts.append(f"用户主要提问：{first_user[:100]}")
+    if last_user and last_user != first_user:
+        parts.append(f"最近问题：{last_user[:80]}")
+    if last_answer:
+        parts.append(f"最近回复：{last_answer[:120]}")
 
-        # 反转为正序（最早的在前）
-        records = list(reversed(records))
-
-        # 转换为字典格式
-        messages = [{"role": item.role, "content": item.content} for item in records]
-
-        logger.info(f"Retrieved {len(messages)} messages for conversation {conversation_id}")
-        if messages:
-            logger.debug(f"First message role: {messages[0]['role']}, Last message role: {messages[-1]['role']}")
-
-        return messages
-
-    except Exception as e:
-        logger.error(f"Error retrieving messages for conversation {conversation_id}: {e}")
-        return []
-
-
-async def get_conversation_summary(conversation_id: str, max_tokens: int = 500) -> str: # type: ignore
-    """
-    获取会话摘要（可选功能，用于压缩长对话历史）。
-
-    当对话历史过长时，可以使用此函数生成摘要，避免超出token限制。
-    """
-    # TODO: 实现基于LLM的对话摘要功能
-    pass
+    summary = "；".join(parts)
+    return summary[:max_chars]
