@@ -10,6 +10,12 @@ class KnowledgeDocumentOut(BaseModel):
     file_name: str
     chunk_count: int
     status: str
+    storage_location: str = "local"
+    file_size: int = 0
+    content_type: str = ""
+    asset_url: str = ""
+    download_url: str = ""
+    preview_url: str = ""
     group_name: str = ""
     tags: list[str] = []
     description: str = ""

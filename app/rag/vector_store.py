@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+
+from app.core.storage import VECTOR_ROOT
 
 
 class HashEmbeddings(Embeddings):
@@ -42,11 +45,47 @@ class HashEmbeddings(Embeddings):
         return self._encode(text)
 
 
+def _normalize_embedding_text(text: str, max_length: int = 2000) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return "empty"
+    if len(normalized) <= max_length:
+        return normalized
+
+    head_size = max_length // 2
+    tail_size = max_length - head_size - 1
+    return f"{normalized[:head_size]} {normalized[-tail_size:]}"
+
+
+class SafeDashScopeEmbeddings(Embeddings):
+    def __init__(
+        self,
+        model: str,
+        dashscope_api_key: str,
+        max_input_length: int = 2000,
+    ):
+        self.max_input_length = max_input_length
+        self.client = DashScopeEmbeddings(
+            model=model,
+            dashscope_api_key=dashscope_api_key,
+        )
+
+    def _prepare_text(self, text: str) -> str:
+        return _normalize_embedding_text(text, max_length=self.max_input_length)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        prepared = [self._prepare_text(text) for text in texts]
+        return self.client.embed_documents(prepared)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.client.embed_query(self._prepare_text(text))
+
+
 def get_embeddings_model() -> Embeddings:
     dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
     if dashscope_api_key:
         try:
-            return DashScopeEmbeddings(
+            return SafeDashScopeEmbeddings(
                 model="text-embedding-v2",
                 dashscope_api_key=dashscope_api_key,
             )
@@ -56,7 +95,7 @@ def get_embeddings_model() -> Embeddings:
 
 
 class UserVectorStore:
-    def __init__(self, base_path: str = "app/data/faiss"):
+    def __init__(self, base_path: str | Path = VECTOR_ROOT):
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.embeddings = get_embeddings_model()

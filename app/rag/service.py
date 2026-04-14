@@ -7,25 +7,26 @@ RAG 业务服务层。
 from __future__ import annotations
 
 import re
-import uuid
 from pathlib import Path
 from typing import Any
 
 from langchain_core.documents import Document
 
+from app.core.storage import (
+    UPLOAD_ROOT,
+    build_upload_url,
+    detect_content_type,
+    make_unique_filename,
+    resolve_data_path,
+    safe_unlink,
+    to_data_relative_path,
+    user_upload_dir,
+)
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_document import KnowledgeDocument
 from app.models.knowledge_document_meta import KnowledgeDocumentMeta
 from app.rag.loader import load_text_from_file, split_text_content
 from app.rag.vector_store import vector_store_manager
-
-UPLOAD_ROOT = Path("app/data/uploads")
-
-
-def _user_upload_dir(user_id: str) -> Path:
-    path = UPLOAD_ROOT / user_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def _parse_tags(raw_tags: str | None) -> list[str]:
@@ -85,9 +86,7 @@ async def save_uploaded_document(
     save_path: Path | None = None
 
     try:
-        ext = Path(file_name).suffix.lower()
-        unique_name = f"{uuid.uuid4().hex}{ext}"
-        save_path = _user_upload_dir(user_id) / unique_name
+        save_path = user_upload_dir(user_id) / make_unique_filename(file_name, fallback_ext=".txt")
         save_path.write_bytes(content)
 
         text = load_text_from_file(str(save_path))
@@ -98,7 +97,7 @@ async def save_uploaded_document(
             user_id=user_id,
             title=Path(file_name).stem,
             file_name=file_name,
-            file_path=str(save_path).replace("\\", "/"),
+            file_path=to_data_relative_path(save_path),
             content=text,
             status="processing",
         )
@@ -141,15 +140,15 @@ async def save_uploaded_document(
         if document:
             document.status = "failed"
             await document.save()
-        if save_path and save_path.exists():
-            save_path.unlink()
+        if save_path:
+            safe_unlink(save_path, root=UPLOAD_ROOT)
         raise
     except Exception as exc:
         if document:
             document.status = "failed"
             await document.save()
-        if save_path and save_path.exists():
-            save_path.unlink()
+        if save_path:
+            safe_unlink(save_path, root=UPLOAD_ROOT)
         raise ValueError(f"文档处理失败: {exc}") from exc
 
 
@@ -186,9 +185,12 @@ async def delete_document_assets(document: KnowledgeDocument) -> None:
     user_id = str(document.user_id)
 
     if document.file_path:
-        file_path = Path(document.file_path)
-        if file_path.exists() and file_path.is_file():
-            file_path.unlink()
+        try:
+            file_path = resolve_data_path(document.file_path)
+        except ValueError:
+            file_path = None
+        if file_path:
+            safe_unlink(file_path, root=UPLOAD_ROOT)
 
     await KnowledgeChunk.filter(document=document).delete()
     await KnowledgeDocumentMeta.filter(document=document).delete()
@@ -201,6 +203,22 @@ async def get_document_meta_map(document_ids: list[str]) -> dict[str, KnowledgeD
         return {}
     meta_records = await KnowledgeDocumentMeta.filter(document_id__in=document_ids)
     return {str(item.document_id): item for item in meta_records}
+
+
+def get_document_storage_info(document: KnowledgeDocument) -> dict[str, Any]:
+    try:
+        file_path = resolve_data_path(document.file_path)
+        relative_path = file_path.relative_to(UPLOAD_ROOT.resolve()).as_posix()
+    except Exception:
+        file_path = None
+        relative_path = ""
+
+    return {
+        "storage_location": "local",
+        "file_size": file_path.stat().st_size if file_path and file_path.exists() else 0,
+        "content_type": detect_content_type(document.file_name),
+        "asset_url": build_upload_url(relative_path) if relative_path else "",
+    }
 
 
 async def search_user_knowledge(

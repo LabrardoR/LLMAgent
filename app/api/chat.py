@@ -1,20 +1,11 @@
-"""
-聊天 API。
-
-能力：
-1. 会话和消息管理；
-2. SSE 聊天；
-3. 回答重新生成；
-4. 短期记忆、长期记忆、RAG 统一注入；
-5. 会话摘要、导出、分支、统计。
-"""
-
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from app.agent.agent import get_agent
@@ -43,6 +34,18 @@ from app.schemas.chat import (
 router = APIRouter()
 
 
+def _json_dumps(data: dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _sse_event(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {_json_dumps(payload)}\n\n"
+
+
+def _chunk_text(content: str, chunk_size: int = 32) -> list[str]:
+    return [content[index:index + chunk_size] for index in range(0, len(content), chunk_size)]
+
+
 def _extract_text_from_agent_result(result: Any) -> str:
     if isinstance(result, str):
         return result
@@ -62,19 +65,15 @@ def _extract_text_from_agent_result(result: Any) -> str:
     return content if isinstance(content, str) else str(content)
 
 
-def _extract_text_from_chunk(chunk: Any) -> str:
-    content = getattr(chunk, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if text:
-                    text_parts.append(str(text))
-        return "".join(text_parts)
-    return str(content)
+def _validate_chat_request(chat_request: ChatRequest) -> None:
+    if not chat_request.messages:
+        raise HTTPException(status_code=400, detail="消息列表不能为空")
+
+    last_message = chat_request.messages[-1]
+    if last_message.role != "user":
+        raise HTTPException(status_code=400, detail="最后一条消息必须是用户消息")
+    if not last_message.content.strip():
+        raise HTTPException(status_code=400, detail="消息内容不能为空")
 
 
 async def _get_active_conversation(conversation_id: str, current_user: User) -> Conversation:
@@ -119,8 +118,7 @@ async def _build_agent_messages(
     if long_memories:
         context_parts.append("【长期记忆】\n" + "\n".join(f"- {item}" for item in long_memories))
 
-    context_prompt = "\n\n".join(context_parts)
-    return context_prompt, history, rag_payload["references"]
+    return "\n\n".join(context_parts), history, rag_payload["references"]
 
 
 async def _maybe_update_conversation_title(conversation: Conversation, user_input: str) -> None:
@@ -196,6 +194,40 @@ async def _run_agent_for_message(
 @router.get("/conversations", response_model=list[ConversationOut], summary="获取当前用户的所有会话")
 async def get_user_conversations(current_user: User = Depends(get_current_user)):
     return await Conversation.filter(user=current_user, status=1).order_by("-updated_time")
+
+
+@router.get("/conversations/search", summary="搜索会话")
+async def search_conversations(
+    keyword: str = Query(..., min_length=1, max_length=100),
+    limit: int = Query(10, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+):
+    keyword_lower = keyword.strip().lower()
+    conversations = await Conversation.filter(user=current_user, status=1).order_by("-updated_time")
+    results: list[dict[str, Any]] = []
+
+    for conversation in conversations:
+        matched_in_title = keyword_lower in (conversation.title or "").lower()
+        messages = await Message.filter(conversation=conversation).order_by("-created_time").limit(20)
+        matched_messages = [msg for msg in messages if keyword_lower in (msg.content or "").lower()]
+        if not matched_in_title and not matched_messages:
+            continue
+
+        snippet = matched_messages[0].content[:160] if matched_messages else conversation.title
+        results.append(
+            {
+                "conversation_id": str(conversation.conversation_id),
+                "title": conversation.title,
+                "matched_in_title": matched_in_title,
+                "match_count": len(matched_messages),
+                "snippet": snippet,
+                "updated_time": conversation.updated_time,
+            }
+        )
+        if len(results) >= limit:
+            break
+
+    return results
 
 
 @router.post("/conversations", summary="创建新会话")
@@ -305,8 +337,7 @@ async def branch_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conversation = await _get_active_conversation(conversation_id, current_user)
-    messages_query = Message.filter(conversation=conversation).order_by("created_time")
-    source_messages = await messages_query
+    source_messages = await Message.filter(conversation=conversation).order_by("created_time")
 
     if payload.message_id:
         target = await Message.get_or_none(
@@ -461,11 +492,12 @@ async def stream_generator(
     current_user: User,
     conversation: Conversation,
     created_new: bool,
+    request: Request,
 ):
     if created_new:
-        yield f"data: {json.dumps({'conversation_id': str(conversation.conversation_id)})}\n\n"
+        yield _sse_event("conversation", {"conversation_id": str(conversation.conversation_id)})
 
-    user_input = chat_request.messages[-1].content
+    user_input = chat_request.messages[-1].content.strip()
     await _maybe_update_conversation_title(conversation, user_input)
 
     user_message = await Message.create(
@@ -478,6 +510,14 @@ async def stream_generator(
         user_id=str(current_user.user_id),
         text=user_input,
         source_message_id=user_message.message_id,
+    )
+    yield _sse_event(
+        "message",
+        {
+            "conversation_id": str(conversation.conversation_id),
+            "user_message_id": str(user_message.message_id),
+            "status": "started",
+        },
     )
 
     context_prompt, chat_history, references = await _build_agent_messages(
@@ -495,45 +535,77 @@ async def stream_generator(
         reference_count=len(references),
     )
 
-    full_response = ""
     final_result: dict[str, Any] = {}
+    task = asyncio.create_task(
+        agent.ainvoke(
+            {
+                "input": user_input,
+                "chat_history": chat_history,
+            }
+        )
+    )
+
     try:
-        async for event in agent.astream_events(
-            {"input": user_input, "chat_history": chat_history},
-            version="v2",
-        ):
-            event_name = event.get("event")
-            if event_name in {"on_chat_model_stream", "on_llm_stream"}:
-                chunk_text = _extract_text_from_chunk(event["data"]["chunk"])
-                if not chunk_text:
-                    continue
-                full_response += chunk_text
-                yield f"data: {json.dumps({'content': chunk_text})}\n\n"
-            elif event_name == "on_chat_model_end":
-                final_result = event["data"].get("result", {})
+        while True:
+            if await request.is_disconnected():
+                task.cancel()
+                return
+            try:
+                final_result = await asyncio.wait_for(asyncio.shield(task), timeout=8)
+                break
+            except asyncio.TimeoutError:
+                yield _sse_event("ping", {"timestamp": int(time.time())})
+
+        content = _extract_text_from_agent_result(final_result)
+        if content:
+            for chunk_text in _chunk_text(content):
+                if await request.is_disconnected():
+                    return
+                yield _sse_event("token", {"content": chunk_text})
+                await asyncio.sleep(0)
+
+        assistant_message = await _save_assistant_message(conversation, current_user, content)
+        yield _sse_event("references", {"references": references})
+        yield _sse_event("tool_calls", {"tool_calls": final_result.get("tool_calls", [])})
+        yield _sse_event(
+            "meta",
+            {
+                "selected_model": final_result.get("selected_model"),
+                "resolved_model": final_result.get("resolved_model"),
+                "duration_ms": final_result.get("duration_ms", 0),
+            },
+        )
+        yield _sse_event(
+            "done",
+            {
+                "conversation_id": str(conversation.conversation_id),
+                "message_id": str(assistant_message.message_id) if assistant_message else None,
+                "done": True,
+            },
+        )
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
     except Exception as exc:
-        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-        return
-
-    if not full_response:
-        full_response = _extract_text_from_agent_result(final_result)
-        if full_response:
-            yield f"data: {json.dumps({'content': full_response})}\n\n"
-
-    assistant_message = await _save_assistant_message(conversation, current_user, full_response)
-    yield f"data: {json.dumps({'references': references})}\n\n"
-    yield f"data: {json.dumps({'tool_calls': final_result.get('tool_calls', [])})}\n\n"
-    yield f"data: {json.dumps({'selected_model': final_result.get('selected_model'), 'resolved_model': final_result.get('resolved_model'), 'duration_ms': final_result.get('duration_ms', 0)})}\n\n"
-    yield f"data: {json.dumps({'message_id': str(assistant_message.message_id) if assistant_message else None, 'done': True})}\n\n"
+        if not task.done():
+            task.cancel()
+        yield _sse_event(
+            "error",
+            {
+                "conversation_id": str(conversation.conversation_id),
+                "error": str(exc),
+                "done": True,
+            },
+        )
 
 
 @router.post("/", summary="聊天")
 async def chat(
     chat_request: ChatRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
 ):
-    if not chat_request.messages:
-        raise HTTPException(status_code=400, detail="消息列表不能为空")
+    _validate_chat_request(chat_request)
 
     created_new = False
     if chat_request.conversation_id:
@@ -548,7 +620,7 @@ async def chat(
         "X-Accel-Buffering": "no",
     }
     return StreamingResponse(
-        stream_generator(chat_request, current_user, conversation, created_new),
+        stream_generator(chat_request, current_user, conversation, created_new, request),
         media_type="text/event-stream",
         headers=headers,
     )
@@ -559,15 +631,14 @@ async def chat_sync(
     chat_request: ChatRequest,
     current_user: User = Depends(get_current_user),
 ):
-    if not chat_request.messages:
-        raise HTTPException(status_code=400, detail="消息列表不能为空")
+    _validate_chat_request(chat_request)
 
     if chat_request.conversation_id:
         conversation = await _get_active_conversation(str(chat_request.conversation_id), current_user)
     else:
         conversation = await Conversation.create(user=current_user)
 
-    user_input = chat_request.messages[-1].content
+    user_input = chat_request.messages[-1].content.strip()
     await _maybe_update_conversation_title(conversation, user_input)
 
     user_message = await Message.create(

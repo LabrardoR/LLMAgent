@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
@@ -25,14 +24,16 @@ from app.api import memory as memory_api
 from app.api import tools as tools_api
 from app.api import user as user_api
 from app.config.db_config import init_db
+from app.core.storage import ASSET_ROOT, UPLOAD_ROOT, ensure_storage_dirs
 from app.core.security import cleanup_expired_tokens, get_current_user
 
 load_dotenv()
-os.makedirs(os.path.join("app", "static", "avatars"), exist_ok=True)
+ensure_storage_dirs()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    ensure_storage_dirs()
     await init_db()
     await cleanup_expired_tokens()
     yield
@@ -45,9 +46,9 @@ app.include_router(knowledge_api.router, prefix="/api/knowledge", tags=["知识�
 app.include_router(memory_api.router, prefix="/api/memory", tags=["记忆管理"])
 app.include_router(tools_api.router, prefix="/api/tools", tags=["工具管理"])
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "app" / "static"
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/assets", StaticFiles(directory=ASSET_ROOT), name="assets")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
+app.mount("/static", StaticFiles(directory=ASSET_ROOT), name="static")
 
 
 class ModelSelectRequest(BaseModel):
@@ -112,7 +113,6 @@ async def select_model(payload: ModelSelectRequest, current_user=Depends(get_cur
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="不支持的模型") from exc
     return {"model_name": await get_selected_model(str(current_user.user_id))}
-
 
 HOST = os.getenv("APP_HOST", "127.0.0.1")
 PORT = int(os.getenv("APP_PORT", 8000))
